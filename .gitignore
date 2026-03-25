@@ -75,3 +75,5 @@ task2_3_4_cv_quality/models/uploaded/*
 # Generated reports (keep declarations and technical report tracked)
 reports/*.tmp
 reports/*.bak
+
+*.claude
