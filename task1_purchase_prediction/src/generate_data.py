@@ -18,14 +18,14 @@ np.random.seed(SEED)
 @dataclass(frozen=True)
 class Customer:
     customer_id: str
-    customer_type: str  # household, restaurant, retailer, cafe, hotel
+    customer_type: str
 
 
 @dataclass(frozen=True)
 class Producer:
     producer_id: str
     producer_name: str
-    category: str  # farm, dairy, bakery, orchard, fishery
+    category: str
 
 
 @dataclass(frozen=True)
@@ -80,8 +80,6 @@ PRODUCTS: List[Product] = [
     Product("Salmon", 6.50, "fishery", "pack"),
 ]
 
-# Seasonal demand multipliers per product.
-# Higher than 1.0 means higher demand in that season.
 SEASONAL_MULTIPLIERS: Dict[str, Dict[str, float]] = {
     "Tomatoes": {"winter": 0.8, "spring": 1.0, "summer": 1.35, "autumn": 1.05},
     "Potatoes": {"winter": 1.2, "spring": 1.0, "summer": 0.9, "autumn": 1.1},
@@ -119,6 +117,36 @@ PRODUCT_BASE_QUANTITY: Dict[str, Tuple[int, int]] = {
     "Croissant": (2, 16),
     "Salmon": (1, 5),
 }
+
+OUTPUT_COLUMNS = [
+    "order_id",
+    "customer_id",
+    "customer_type",
+    "producer_id",
+    "product",
+    "quantity",
+    "unit_price",
+    "total_price",
+    "order_date",
+    "month",
+    "season",
+    "is_reorder",
+]
+
+CRITICAL_FIELDS = [
+    "order_id",
+    "customer_id",
+    "customer_type",
+    "producer_id",
+    "product",
+    "quantity",
+    "unit_price",
+    "total_price",
+    "order_date",
+    "month",
+    "season",
+    "is_reorder",
+]
 
 
 def get_project_root() -> Path:
@@ -159,7 +187,6 @@ def build_producers_by_category(producers: List[Producer]) -> Dict[str, List[Pro
 
 
 def choose_product(customer_type: str) -> str:
-    # Slight customer preference bias.
     weighted_products = {
         "household": [
             "Milk", "Bread", "Apples", "Tomatoes", "Potatoes",
@@ -188,7 +215,6 @@ def choose_product(customer_type: str) -> str:
         ],
     }
     pool = weighted_products.get(customer_type, [p.product for p in PRODUCTS])
-    # Heavier weighting toward earlier items.
     weights = np.linspace(len(pool), 1, len(pool))
     return random.choices(pool, weights=weights, k=1)[0]
 
@@ -196,21 +222,77 @@ def choose_product(customer_type: str) -> str:
 def calculate_quantity(product_name: str, customer_type: str, season: str) -> int:
     low, high = PRODUCT_BASE_QUANTITY[product_name]
     base_qty = random.randint(low, high)
-
     seasonal_factor = SEASONAL_MULTIPLIERS[product_name][season]
     customer_factor = CUSTOMER_TYPE_ORDER_MULTIPLIER[customer_type]
-
     quantity = int(round(base_qty * seasonal_factor * customer_factor))
-
-    # Keep at least 1 item.
     return max(1, quantity)
 
 
 def calculate_unit_price(base_price: float, season_multiplier: float) -> float:
-    # Demand and mild market fluctuation affect price.
     noise = random.uniform(0.93, 1.08)
     price = base_price * (0.96 + 0.08 * season_multiplier) * noise
     return round(price, 2)
+
+
+def enforce_orders_schema(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    df = df[OUTPUT_COLUMNS]
+
+    df["order_id"] = df["order_id"].astype("string")
+    df["customer_id"] = df["customer_id"].astype("string")
+    df["customer_type"] = df["customer_type"].astype("string")
+    df["producer_id"] = df["producer_id"].astype("string")
+    df["product"] = df["product"].astype("string")
+    df["quantity"] = df["quantity"].astype("int64")
+    df["unit_price"] = df["unit_price"].astype("float64").round(2)
+    df["total_price"] = df["total_price"].astype("float64").round(2)
+    df["order_date"] = pd.to_datetime(df["order_date"]).dt.strftime("%Y-%m-%d")
+    df["order_date"] = df["order_date"].astype("string")
+    df["month"] = df["month"].astype("int64")
+    df["season"] = df["season"].astype("string")
+    df["is_reorder"] = df["is_reorder"].astype("int64")
+
+    return df
+
+
+def validate_orders_dataframe(df: pd.DataFrame) -> None:
+    missing_columns = [col for col in OUTPUT_COLUMNS if col not in df.columns]
+    if missing_columns:
+        raise ValueError(f"Missing required columns: {missing_columns}")
+
+    null_counts = df[CRITICAL_FIELDS].isnull().sum()
+    null_counts = null_counts[null_counts > 0]
+    if not null_counts.empty:
+        raise ValueError(f"Nulls found in critical fields:\n{null_counts}")
+
+    if df["order_id"].duplicated().any():
+        raise ValueError("Duplicate order_id values found.")
+
+    if (df["quantity"] <= 0).any():
+        raise ValueError("quantity must be strictly positive.")
+
+    if (df["unit_price"] <= 0).any():
+        raise ValueError("unit_price must be strictly positive.")
+
+    if (df["total_price"] <= 0).any():
+        raise ValueError("total_price must be strictly positive.")
+
+    if not df["month"].between(1, 12).all():
+        raise ValueError("month must be between 1 and 12.")
+
+    valid_seasons = {"winter", "spring", "summer", "autumn"}
+    if not df["season"].isin(valid_seasons).all():
+        raise ValueError("Invalid season values found.")
+
+    if not df["is_reorder"].isin([0, 1]).all():
+        raise ValueError("is_reorder must contain only 0 or 1.")
+
+    expected_total = (df["quantity"] * df["unit_price"]).round(2)
+    if not np.allclose(df["total_price"].to_numpy(), expected_total.to_numpy(), atol=1e-9):
+        raise ValueError("total_price does not match quantity * unit_price.")
+
+    pd.to_datetime(df["order_date"], format="%Y-%m-%d", errors="raise")
 
 
 def generate_orders(
@@ -242,6 +324,7 @@ def generate_orders(
         quantity = calculate_quantity(product_name, customer.customer_type, season)
         seasonal_multiplier = SEASONAL_MULTIPLIERS[product_name][season]
         unit_price = calculate_unit_price(product_meta.base_price, seasonal_multiplier)
+        total_price = round(quantity * unit_price, 2)
 
         history_key = (customer.customer_id, product_name)
         is_reorder = 1 if customer_product_history.get(history_key, 0) > 0 else 0
@@ -256,6 +339,7 @@ def generate_orders(
                 "product": product_name,
                 "quantity": quantity,
                 "unit_price": unit_price,
+                "total_price": total_price,
                 "order_date": order_dt.strftime("%Y-%m-%d"),
                 "month": month,
                 "season": season,
@@ -264,6 +348,8 @@ def generate_orders(
         )
 
     orders_df = pd.DataFrame(rows).sort_values("order_date").reset_index(drop=True)
+    orders_df = enforce_orders_schema(orders_df)
+    validate_orders_dataframe(orders_df)
     return orders_df
 
 
@@ -272,9 +358,33 @@ def save_reference_tables(raw_dir: Path) -> None:
     producers_df = pd.DataFrame([asdict(p) for p in PRODUCERS])
     products_df = pd.DataFrame([asdict(p) for p in PRODUCTS])
 
+    customers_df["customer_id"] = customers_df["customer_id"].astype("string")
+    customers_df["customer_type"] = customers_df["customer_type"].astype("string")
+
+    producers_df["producer_id"] = producers_df["producer_id"].astype("string")
+    producers_df["producer_name"] = producers_df["producer_name"].astype("string")
+    producers_df["category"] = producers_df["category"].astype("string")
+
+    products_df["product"] = products_df["product"].astype("string")
+    products_df["base_price"] = products_df["base_price"].astype("float64").round(2)
+    products_df["producer_category"] = products_df["producer_category"].astype("string")
+    products_df["unit"] = products_df["unit"].astype("string")
+
     customers_df.to_csv(raw_dir / "customers.csv", index=False)
     producers_df.to_csv(raw_dir / "producers.csv", index=False)
     products_df.to_csv(raw_dir / "products.csv", index=False)
+
+
+def print_orders_schema(df: pd.DataFrame) -> None:
+    print("\nConfirmed orders.csv schema:")
+    for column in OUTPUT_COLUMNS:
+        print(f"- {column}: {df[column].dtype}")
+
+    print("\nCritical field null counts:")
+    print(df[CRITICAL_FIELDS].isnull().sum())
+
+    print("\norders.csv shape:", df.shape)
+    print(df.head())
 
 
 def main() -> None:
@@ -284,11 +394,8 @@ def main() -> None:
     orders_df.to_csv(raw_dir / "orders.csv", index=False)
 
     save_reference_tables(raw_dir)
-
     print(f"Saved files to: {raw_dir}")
-    print(f"orders.csv shape: {orders_df.shape}")
-    print("Preview:")
-    print(orders_df.head())
+    print_orders_schema(orders_df)
 
 
 if __name__ == "__main__":
