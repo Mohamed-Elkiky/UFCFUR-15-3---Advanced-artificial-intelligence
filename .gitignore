@@ -1,0 +1,77 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Native extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables
+.env
+.env.*
+*.env
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Testing, linting, typing caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Logs
+logs/
+*.log
+
+# Local databases / runtime files
+*.db
+*.sqlite
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# ML artifacts and generated outputs
+task1_purchase_prediction/data/raw/*
+!task1_purchase_prediction/data/raw/.gitkeep
+!task1_purchase_prediction/data/raw/DATASET_PLACEHOLDER.md
+task1_purchase_prediction/data/processed/*
+!task1_purchase_prediction/data/processed/.gitkeep
+task1_purchase_prediction/models/*
+!task1_purchase_prediction/models/.gitkeep
+
+task2_3_4_cv_quality/data/raw/*
+!task2_3_4_cv_quality/data/raw/.gitkeep
+!task2_3_4_cv_quality/data/raw/DATASET_PLACEHOLDER.md
+task2_3_4_cv_quality/data/processed/*
+!task2_3_4_cv_quality/data/processed/.gitkeep
+task2_3_4_cv_quality/models/*
+!task2_3_4_cv_quality/models/.gitkeep
+task2_3_4_cv_quality/models/uploaded/*
+!task2_3_4_cv_quality/models/uploaded/.gitkeep
+
+# Generated reports (keep declarations and technical report tracked)
+reports/*.tmp
+reports/*.bak
