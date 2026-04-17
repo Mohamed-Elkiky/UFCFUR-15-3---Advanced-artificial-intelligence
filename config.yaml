@@ -1,7 +1,8 @@
 task2_3_4_cv_quality:
-  data_root: task2_3_4_cv_quality/data/raw/dataset
-  train_dir: task2_3_4_cv_quality/data/raw/dataset/Train
-  test_dir: task2_3_4_cv_quality/data/raw/dataset/Test
+task2_3_4_cv_quality:
+  data_root: task2_3_4_cv_quality/data/raw/Fruit And Vegetable Diseases Dataset
+  train_dir: task2_3_4_cv_quality/data/raw/Fruit And Vegetable Diseases Dataset
+  test_dir: task2_3_4_cv_quality/data/raw/Fruit And Vegetable Diseases Dataset
   image_size: 224
   mean: [0.485, 0.456, 0.406]
   std: [0.229, 0.224, 0.225]
