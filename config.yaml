@@ -5,3 +5,8 @@ task2_3_4_cv_quality:
   image_size: 224
   mean: [0.485, 0.456, 0.406]
   std: [0.229, 0.224, 0.225]
+  val_split: 0.2
+  batch_size: 32
+  num_workers: 0
+  random_seed: 42
+  imbalance_threshold: 0.7
