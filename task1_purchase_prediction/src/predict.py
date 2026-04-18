@@ -1,11 +1,34 @@
+"""
+Inference pipeline for Task 1 Purchase Prediction.
+
+Exposes two entry points used by the API and by offline demos:
+
+    - :func:`get_quick_reorder`: a pure frequency-based lookup that returns
+      the products a customer has ordered most often. Does not require the
+      trained model and is therefore resilient to model-file absence.
+
+    - :func:`predict_reorder`: runs the trained classifier against a
+      customer's history and returns the top-N next-product suggestions
+      with their confidence scores.
+
+Feature engineering is delegated to ``preprocess.py`` so that inference
+features are guaranteed to match the representation used at training time.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Union
 
 import joblib
 import numpy as np
 import pandas as pd
+
+from task1_purchase_prediction.src.preprocess import (
+    history_to_feature_frame,
+    load_class_names,
+    load_orders,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -15,86 +38,23 @@ DEFAULT_MODEL_PATH = BASE_DIR / "models" / "reorder_model.pkl"
 DEFAULT_CLASS_NAMES_PATH = BASE_DIR / "models" / "class_names.pkl"
 
 
-REQUIRED_COLUMNS = {"customer_id", "product", "quantity", "order_date"}
-
-
-def _load_orders(orders_path: str | Path = DEFAULT_ORDERS_PATH) -> pd.DataFrame:
-    orders_path = Path(orders_path)
-    if not orders_path.exists():
-        raise FileNotFoundError(f"Orders file not found: {orders_path}")
-
-    df = pd.read_csv(orders_path)
-
-    missing = REQUIRED_COLUMNS - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing required columns in orders.csv: {sorted(missing)}")
-
-    df = df.copy()
-    df["customer_id"] = df["customer_id"].astype(str)
-    df["product"] = df["product"].astype(str)
-    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
-    df["order_date"] = pd.to_datetime(df["order_date"], errors="coerce")
-    df = df.dropna(subset=["order_date"])
-
-    return df.sort_values("order_date").reset_index(drop=True)
-
-
-def _load_class_names(
+def _load_class_names_cached(
     class_names_path: str | Path = DEFAULT_CLASS_NAMES_PATH,
     products_path: str | Path = DEFAULT_PRODUCTS_PATH,
 ) -> List[str]:
+    """Load class names, preferring the serialised list saved at training time."""
     class_names_path = Path(class_names_path)
     if class_names_path.exists():
-        class_names = joblib.load(class_names_path)
-        return list(class_names)
-
-    products_path = Path(products_path)
-    if products_path.exists():
-        products_df = pd.read_csv(products_path)
-        if "product" not in products_df.columns:
-            raise ValueError("products.csv must contain a 'product' column")
-        return products_df["product"].astype(str).tolist()
-
-    raise FileNotFoundError(
-        f"Neither class names file nor products file could be found:\n"
-        f"- {class_names_path}\n"
-        f"- {products_path}"
-    )
+        return list(joblib.load(class_names_path))
+    return load_class_names(products_path)
 
 
 def _load_model(model_path: str | Path = DEFAULT_MODEL_PATH):
+    """Load the trained classifier from disk."""
     model_path = Path(model_path)
     if not model_path.exists():
         raise FileNotFoundError(f"Model file not found: {model_path}")
     return joblib.load(model_path)
-
-
-def _build_feature_vector(
-    customer_history: pd.DataFrame,
-    class_names: List[str],
-) -> pd.DataFrame:
-    """
-    Convert one customer's grouped purchase history into a single-row feature vector.
-    Each feature is the frequency count and total quantity for one product.
-    """
-    grouped = (
-        customer_history.groupby("product", as_index=False)
-        .agg(
-            order_count=("product", "count"),
-            total_quantity=("quantity", "sum"),
-        )
-    )
-
-    frequency_lookup = dict(zip(grouped["product"], grouped["order_count"]))
-    quantity_lookup = dict(zip(grouped["product"], grouped["total_quantity"]))
-
-    feature_row: Dict[str, float] = {}
-
-    for product in class_names:
-        feature_row[f"freq_{product}"] = float(frequency_lookup.get(product, 0))
-        feature_row[f"qty_{product}"] = float(quantity_lookup.get(product, 0))
-
-    return pd.DataFrame([feature_row])
 
 
 def get_quick_reorder(
@@ -103,10 +63,29 @@ def get_quick_reorder(
     orders_path: str | Path = DEFAULT_ORDERS_PATH,
 ) -> List[Dict]:
     """
-    Group orders by customer_id + product, count frequency,
-    and return the top N most ordered items.
+    Return the ``top_n`` products a customer has ordered most often.
+
+    This is a non-ML, frequency-based suggestion used to give customers
+    a fast "reorder your usuals" experience. Ordering tiebreakers fall
+    back to total quantity and then recency of last order.
+
+    Parameters
+    ----------
+    customer_id : str
+        The customer whose history should be analysed.
+    top_n : int, default=5
+        Maximum number of products to return.
+    orders_path : str | Path, default=DEFAULT_ORDERS_PATH
+        Path to the orders CSV file.
+
+    Returns
+    -------
+    List[Dict]
+        A list of suggestion dicts, each containing ``product``,
+        ``order_count``, ``total_quantity`` and ``last_order_date``.
+        Returns an empty list if the customer has no recorded orders.
     """
-    orders_df = _load_orders(orders_path)
+    orders_df = load_orders(orders_path)
     customer_history = orders_df[orders_df["customer_id"] == customer_id].copy()
 
     if customer_history.empty:
@@ -142,15 +121,42 @@ def get_quick_reorder(
 
 def predict_reorder(
     customer_id: str,
-    history: pd.DataFrame | List[Dict],
+    history: Union[pd.DataFrame, List[Dict]],
     top_n: int = 5,
     model_path: str | Path = DEFAULT_MODEL_PATH,
     class_names_path: str | Path = DEFAULT_CLASS_NAMES_PATH,
     products_path: str | Path = DEFAULT_PRODUCTS_PATH,
 ) -> List[Dict]:
     """
-    Preprocess the history into model features, run model.predict()/predict_proba(),
-    map predictions back to product names, and return suggestions with confidence scores.
+    Predict a customer's next likely purchases using the trained model.
+
+    The customer's history is converted to the model's feature
+    representation, the classifier's class probabilities are computed,
+    and the top-N most probable products are returned.
+
+    Parameters
+    ----------
+    customer_id : str
+        The customer whose next purchases should be predicted.
+    history : pd.DataFrame | List[Dict]
+        Purchase history containing at minimum ``customer_id``, ``product``
+        and ``quantity`` fields. Only rows matching ``customer_id`` are used.
+    top_n : int, default=5
+        Maximum number of product suggestions to return.
+    model_path : str | Path
+        Path to the serialised trained model.
+    class_names_path : str | Path
+        Path to the serialised class-name list.
+    products_path : str | Path
+        Fallback path used to recover class names if the serialised list
+        cannot be found.
+
+    Returns
+    -------
+    List[Dict]
+        Suggestions sorted by descending confidence, each containing
+        ``product`` and ``confidence_score``. Returns an empty list if
+        the customer has no history to predict from.
     """
     if isinstance(history, list):
         history_df = pd.DataFrame(history)
@@ -168,20 +174,17 @@ def predict_reorder(
     if customer_history.empty:
         return []
 
-    class_names = _load_class_names(class_names_path=class_names_path, products_path=products_path)
+    class_names = _load_class_names_cached(
+        class_names_path=class_names_path,
+        products_path=products_path,
+    )
     model = _load_model(model_path)
 
-    X = _build_feature_vector(customer_history, class_names)
+    X = history_to_feature_frame(customer_history, class_names)
 
+    # Align columns with the model's expected feature names if available
     if hasattr(model, "feature_names_in_"):
         X = X.reindex(columns=model.feature_names_in_, fill_value=0)
-
-    predicted = model.predict(X)
-
-    if isinstance(predicted[0], (str, np.str_)):
-        top_prediction = str(predicted[0])
-    else:
-        top_prediction = class_names[int(predicted[0])]
 
     results: List[Dict] = []
 
@@ -198,9 +201,10 @@ def predict_reorder(
                 }
             )
     else:
+        predicted = model.predict(X)
         results.append(
             {
-                "product": top_prediction,
+                "product": str(predicted[0]),
                 "confidence_score": 1.0,
             }
         )
@@ -222,7 +226,7 @@ if __name__ == "__main__":
         )
 
     try:
-        orders_df = _load_orders()
+        orders_df = load_orders(DEFAULT_ORDERS_PATH)
         predictions = predict_reorder(customer_id, orders_df, top_n=5)
 
         print(f"\nModel predictions for {customer_id}:")
