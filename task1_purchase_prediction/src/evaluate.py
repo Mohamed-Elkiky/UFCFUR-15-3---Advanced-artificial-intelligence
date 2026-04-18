@@ -714,6 +714,147 @@ def print_bias_audit(audit_result: Dict) -> None:
         print("No producers exceeded the flag threshold.")
     print("=" * 80 + "\n")
 
+# ---------------------------------------------------------------------------
+# AA-22: Override Analysis & Monitoring Strategy
+# ---------------------------------------------------------------------------
+
+
+def generate_synthetic_interactions(
+    predictions_df: pd.DataFrame,
+    n_weeks: int = 26,
+    base_override_rate: float = 0.12,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """Simulate user interactions where customers accept or override suggestions."""
+    rng = np.random.default_rng(seed)
+
+    customer_types = {
+        "CUST001": "household", "CUST002": "household",
+        "CUST003": "household", "CUST004": "household",
+        "CUST005": "household", "CUST006": "restaurant",
+        "CUST007": "restaurant", "CUST008": "retailer",
+        "CUST009": "retailer", "CUST010": "cafe",
+        "CUST011": "cafe", "CUST012": "hotel",
+        "CUST013": "household", "CUST014": "restaurant",
+        "CUST015": "retailer",
+    }
+
+    products = predictions_df["true_product"].unique().tolist()
+    start_date = pd.Timestamp("2025-09-01")
+    rows: List[Dict] = []
+
+    for week_num in range(n_weeks):
+        week_start = start_date + pd.Timedelta(weeks=week_num)
+        staleness_factor = 1.0 + 0.015 * week_num
+        n_interactions = rng.integers(25, 50)
+        sampled = predictions_df.sample(
+            n=min(n_interactions, len(predictions_df)),
+            replace=True,
+            random_state=int(rng.integers(0, 2**31)),
+        )
+
+        for _, row in sampled.iterrows():
+            if row["is_correct"]:
+                p_override = base_override_rate * 0.4 * staleness_factor
+            else:
+                p_override = min(0.95, base_override_rate * 3.5 * staleness_factor)
+
+            was_overridden = bool(rng.random() < p_override)
+
+            if was_overridden:
+                alternatives = [p for p in products if p != row["predicted_product"]]
+                actual = rng.choice(alternatives) if alternatives else row["predicted_product"]
+            else:
+                actual = row["predicted_product"]
+
+            day_offset = int(rng.integers(0, 7))
+            rows.append({
+                "interaction_id": f"INT-{len(rows)+1:05d}",
+                "customer_id": str(row["customer_id"]),
+                "customer_type": customer_types.get(str(row["customer_id"]), "unknown"),
+                "predicted_product": str(row["predicted_product"]),
+                "actual_product": str(actual),
+                "was_overridden": was_overridden,
+                "date": week_start + pd.Timedelta(days=day_offset),
+                "week": week_num + 1,
+            })
+
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+def override_analysis(interactions_df: pd.DataFrame) -> Dict:
+    """Compute override rates by product, customer type and week."""
+    required = {"was_overridden", "predicted_product", "customer_type", "week"}
+    missing = required - set(interactions_df.columns)
+    if missing:
+        raise ValueError(f"interactions_df is missing columns: {sorted(missing)}")
+
+    n_total = len(interactions_df)
+    n_overrides = int(interactions_df["was_overridden"].sum())
+    overall_rate = n_overrides / n_total if n_total > 0 else 0.0
+
+    by_product = (
+        interactions_df.groupby("predicted_product", as_index=False)
+        .agg(interactions=("was_overridden", "count"), overrides=("was_overridden", "sum"))
+    )
+    by_product["override_rate"] = by_product["overrides"] / by_product["interactions"]
+    by_product = by_product.sort_values("override_rate", ascending=False).reset_index(drop=True)
+
+    by_customer = (
+        interactions_df.groupby("customer_type", as_index=False)
+        .agg(interactions=("was_overridden", "count"), overrides=("was_overridden", "sum"))
+    )
+    by_customer["override_rate"] = by_customer["overrides"] / by_customer["interactions"]
+    by_customer = by_customer.sort_values("override_rate", ascending=False).reset_index(drop=True)
+
+    weekly = (
+        interactions_df.groupby("week", as_index=False)
+        .agg(interactions=("was_overridden", "count"), overrides=("was_overridden", "sum"))
+    )
+    weekly["override_rate"] = weekly["overrides"] / weekly["interactions"]
+    weekly["rolling_avg"] = weekly["override_rate"].rolling(window=4, min_periods=1).mean()
+
+    retrain_threshold = 0.20
+    weekly["alert"] = weekly["rolling_avg"] > retrain_threshold
+    alert_weeks = weekly.loc[weekly["alert"], "week"].tolist()
+
+    return {
+        "overall_override_rate": float(overall_rate),
+        "by_product": by_product,
+        "by_customer_type": by_customer,
+        "weekly_trend": weekly,
+        "n_interactions": n_total,
+        "n_overrides": n_overrides,
+        "alert_triggered": len(alert_weeks) > 0,
+        "alert_weeks": alert_weeks,
+        "retrain_threshold": retrain_threshold,
+    }
+
+
+def print_override_analysis(result: Dict) -> None:
+    """Print override analysis summary."""
+    print("\n" + "=" * 80)
+    print("OVERRIDE & MONITORING ANALYSIS (AA-22)")
+    print("=" * 80)
+    print(f"Total interactions : {result['n_interactions']}")
+    print(f"Total overrides    : {result['n_overrides']}")
+    print(f"Overall override % : {result['overall_override_rate']:.2%}")
+    print(f"Retrain threshold  : {result['retrain_threshold']:.0%} (rolling 4-week avg)")
+
+    print("\n--- Override Rate by Product ---")
+    print(result["by_product"].to_string(index=False))
+
+    print("\n--- Override Rate by Customer Type ---")
+    print(result["by_customer_type"].to_string(index=False))
+
+    if result["alert_triggered"]:
+        print(f"\n⚠  RETRAIN ALERT: rolling override rate exceeded "
+              f"{result['retrain_threshold']:.0%} in weeks: {result['alert_weeks']}")
+    else:
+        print("\n✓  No retrain alert — override rate within acceptable limits.")
+    print("=" * 80 + "\n")
 
 if __name__ == "__main__":
     """Run evaluation on the trained model."""
