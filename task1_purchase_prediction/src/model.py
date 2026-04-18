@@ -1,13 +1,29 @@
+"""
+Training pipeline for Task 1 Purchase Prediction.
+
+Trains a Random Forest classifier that, given a customer's purchase history,
+predicts the next product they are most likely to order.
+
+The feature-engineering logic is imported from ``preprocess.py`` so that
+training and inference always build features in the same way.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 import joblib
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, classification_report
 from sklearn.model_selection import train_test_split
+
+from task1_purchase_prediction.src.preprocess import (
+    history_to_feature_row,
+    load_class_names,
+    load_orders,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -17,98 +33,45 @@ MODELS_DIR = BASE_DIR / "models"
 DEFAULT_MODEL_PATH = MODELS_DIR / "reorder_model.pkl"
 DEFAULT_CLASS_NAMES_PATH = MODELS_DIR / "class_names.pkl"
 
-REQUIRED_COLUMNS = {"customer_id", "product", "quantity", "order_date"}
-
-
-def _load_orders(orders_path: str | Path = DEFAULT_ORDERS_PATH) -> pd.DataFrame:
-    orders_path = Path(orders_path)
-    if not orders_path.exists():
-        raise FileNotFoundError(f"Orders file not found: {orders_path}")
-
-    df = pd.read_csv(orders_path)
-
-    missing = REQUIRED_COLUMNS - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing required columns in orders.csv: {sorted(missing)}")
-
-    df = df.copy()
-    df["customer_id"] = df["customer_id"].astype(str)
-    df["product"] = df["product"].astype(str)
-    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
-    df["order_date"] = pd.to_datetime(df["order_date"], errors="coerce")
-    df = df.dropna(subset=["order_date"])
-
-    # Stable ordering for sequence generation
-    sort_cols = ["customer_id", "order_date"]
-    if "order_id" in df.columns:
-        sort_cols.append("order_id")
-
-    return df.sort_values(sort_cols).reset_index(drop=True)
-
-
-def _load_class_names(products_path: str | Path = DEFAULT_PRODUCTS_PATH) -> List[str]:
-    products_path = Path(products_path)
-
-    if products_path.exists():
-        products_df = pd.read_csv(products_path)
-        if "product" not in products_df.columns:
-            raise ValueError("products.csv must contain a 'product' column")
-        return products_df["product"].astype(str).tolist()
-
-    # Fallback from orders.csv if products.csv is missing
-    orders_df = _load_orders()
-    return sorted(orders_df["product"].astype(str).unique().tolist())
-
-
-def _empty_feature_dict(class_names: Sequence[str]) -> Dict[str, float]:
-    feature_row: Dict[str, float] = {}
-    for product in class_names:
-        feature_row[f"freq_{product}"] = 0.0
-        feature_row[f"qty_{product}"] = 0.0
-    return feature_row
-
-
-def _history_to_feature_row(
-    history_df: pd.DataFrame,
-    class_names: Sequence[str],
-) -> Dict[str, float]:
-    feature_row = _empty_feature_dict(class_names)
-
-    if history_df.empty:
-        return feature_row
-
-    grouped = (
-        history_df.groupby("product", as_index=False)
-        .agg(
-            order_count=("product", "count"),
-            total_quantity=("quantity", "sum"),
-        )
-    )
-
-    for _, row in grouped.iterrows():
-        product = str(row["product"])
-        if product in class_names:
-            feature_row[f"freq_{product}"] = float(row["order_count"])
-            feature_row[f"qty_{product}"] = float(row["total_quantity"])
-
-    return feature_row
-
 
 def build_training_dataset(
     orders_df: pd.DataFrame,
     class_names: Sequence[str],
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """
-    Build supervised samples:
-    features = customer's purchase history up to time t
-    label    = next product purchased at time t+1
+    Build a supervised training set of (history, next_product) pairs.
+
+    For each customer, orders are sorted chronologically. For each order
+    at position ``idx`` (with ``idx >= 1``) the feature vector summarises
+    orders ``[0, idx)`` and the label is the product purchased at ``idx``.
+
+    Parameters
+    ----------
+    orders_df : pd.DataFrame
+        All orders across all customers.
+    class_names : Sequence[str]
+        The product catalogue used as the feature/label space.
+
+    Returns
+    -------
+    Tuple[pd.DataFrame, pd.Series]
+        ``(X, y)`` where ``X`` is the feature matrix and ``y`` contains
+        the next-product labels.
+
+    Raises
+    ------
+    ValueError
+        If no training samples could be constructed (e.g. every customer
+        has fewer than two orders).
     """
-    X_rows: List[Dict[str, float]] = []
+    X_rows: List[dict] = []
     y_rows: List[str] = []
 
-    for customer_id, customer_df in orders_df.groupby("customer_id"):
-        customer_df = customer_df.sort_values(["order_date"] + (["order_id"] if "order_id" in customer_df.columns else []))
-        customer_df = customer_df.reset_index(drop=True)
+    for _, customer_df in orders_df.groupby("customer_id"):
+        sort_cols = ["order_date"]
+        if "order_id" in customer_df.columns:
+            sort_cols.append("order_id")
+        customer_df = customer_df.sort_values(sort_cols).reset_index(drop=True)
 
         # Need at least 2 orders to predict a next item
         if len(customer_df) < 2:
@@ -118,7 +81,7 @@ def build_training_dataset(
             history = customer_df.iloc[:idx]
             next_product = str(customer_df.iloc[idx]["product"])
 
-            feature_row = _history_to_feature_row(history, class_names)
+            feature_row = history_to_feature_row(history, class_names)
             X_rows.append(feature_row)
             y_rows.append(next_product)
 
@@ -137,12 +100,31 @@ def train_reorder_model(
     model_path: str | Path = DEFAULT_MODEL_PATH,
     class_names_path: str | Path = DEFAULT_CLASS_NAMES_PATH,
 ) -> RandomForestClassifier:
-    orders_df = _load_orders(orders_path)
-    class_names = _load_class_names(products_path)
+    """
+    Train the purchase-prediction model and persist it to disk.
+
+    Parameters
+    ----------
+    orders_path : str | Path
+        Path to the orders CSV file.
+    products_path : str | Path
+        Path to the products CSV file (defines the label space).
+    model_path : str | Path
+        Destination path for the trained model (``.pkl``).
+    class_names_path : str | Path
+        Destination path for the serialised class-name list (``.pkl``).
+
+    Returns
+    -------
+    RandomForestClassifier
+        The trained classifier.
+    """
+    orders_df = load_orders(orders_path)
+    class_names = load_class_names(products_path, fallback_orders_path=orders_path)
 
     X, y = build_training_dataset(orders_df, class_names)
 
-    # Keep only labels that are in class_names
+    # Keep only labels that exist in the product catalogue
     valid_mask = y.isin(class_names)
     X = X.loc[valid_mask].reset_index(drop=True)
     y = y.loc[valid_mask].reset_index(drop=True)
@@ -150,7 +132,7 @@ def train_reorder_model(
     if X.empty or y.empty:
         raise ValueError("Training dataset is empty after filtering valid labels.")
 
-    # If some classes are extremely rare, stratify may fail
+    # Stratification fails if any class appears fewer than 2 times
     label_counts = y.value_counts()
     can_stratify = (label_counts.min() >= 2) and (y.nunique() > 1)
 
