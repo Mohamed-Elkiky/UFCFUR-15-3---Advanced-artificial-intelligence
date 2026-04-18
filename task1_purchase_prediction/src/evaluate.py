@@ -3,6 +3,11 @@ Evaluation module for Task 1 Purchase Prediction model.
 
 This module provides comprehensive evaluation metrics for the reorder
 prediction model including accuracy, precision, recall, F1-score, and ROC-AUC.
+
+It also provides a fairness / bias audit that groups model predictions by
+producer and flags any producer whose share of recommendations is more
+than 20% above the mean. This directly addresses the Fairness,
+Accountability and Trust requirement of the case study.
 """
 
 from __future__ import annotations
@@ -33,6 +38,10 @@ DEFAULT_MODEL_PATH = BASE_DIR / "models" / "reorder_model.pkl"
 DEFAULT_CLASS_NAMES_PATH = BASE_DIR / "models" / "class_names.pkl"
 
 REQUIRED_COLUMNS = {"customer_id", "product", "quantity", "order_date"}
+
+# Threshold above the mean recommendation rate at which a producer is
+# flagged as potentially over-represented in the model's predictions.
+BIAS_FLAG_MULTIPLIER = 1.20
 
 
 def _load_orders(orders_path: str | Path = DEFAULT_ORDERS_PATH) -> pd.DataFrame:
@@ -117,14 +126,14 @@ def build_training_dataset(
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """
     Build supervised training dataset.
-    
+
     Parameters
     ----------
     orders_df : pd.DataFrame
         Orders data
     class_names : List[str]
         List of product names
-        
+
     Returns
     -------
     Tuple[pd.DataFrame, pd.Series]
@@ -133,7 +142,7 @@ def build_training_dataset(
     X_rows: List[Dict[str, float]] = []
     y_rows: List[str] = []
 
-    for customer_id, customer_df in orders_df.groupby("customer_id"):
+    for _, customer_df in orders_df.groupby("customer_id"):
         customer_df = customer_df.sort_values(
             ["order_date"] + (["order_id"] if "order_id" in customer_df.columns else [])
         )
@@ -159,6 +168,80 @@ def build_training_dataset(
     return X, y
 
 
+def build_training_dataset_with_context(
+    orders_df: pd.DataFrame,
+    class_names: List[str],
+) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
+    """
+    Build a supervised training dataset that also preserves order context.
+
+    This is an extended version of :func:`build_training_dataset` that
+    additionally returns the ``producer_id`` and ``customer_id`` associated
+    with each training sample's target product. Those columns are required
+    for fairness / bias analysis, where we need to know which producer
+    actually supplied the product the model is trying to predict.
+
+    Parameters
+    ----------
+    orders_df : pd.DataFrame
+        Orders data. Must include a ``producer_id`` column.
+    class_names : List[str]
+        List of product names.
+
+    Returns
+    -------
+    Tuple[pd.DataFrame, pd.Series, pd.DataFrame]
+        ``(X, y, context)`` where ``context`` has columns
+        ``producer_id`` and ``customer_id`` aligned row-wise with ``X`` and ``y``.
+
+    Raises
+    ------
+    ValueError
+        If ``producer_id`` is missing or no samples can be generated.
+    """
+    if "producer_id" not in orders_df.columns:
+        raise ValueError("orders_df must contain a 'producer_id' column for bias audit")
+
+    X_rows: List[Dict[str, float]] = []
+    y_rows: List[str] = []
+    producer_ids: List[str] = []
+    customer_ids: List[str] = []
+
+    for customer_id, customer_df in orders_df.groupby("customer_id"):
+        customer_df = customer_df.sort_values(
+            ["order_date"] + (["order_id"] if "order_id" in customer_df.columns else [])
+        )
+        customer_df = customer_df.reset_index(drop=True)
+
+        if len(customer_df) < 2:
+            continue
+
+        for idx in range(1, len(customer_df)):
+            history = customer_df.iloc[:idx]
+            target_row = customer_df.iloc[idx]
+            next_product = str(target_row["product"])
+
+            feature_row = _history_to_feature_row(history, class_names)
+            X_rows.append(feature_row)
+            y_rows.append(next_product)
+            producer_ids.append(str(target_row["producer_id"]))
+            customer_ids.append(str(customer_id))
+
+    if not X_rows:
+        raise ValueError("No training samples generated")
+
+    X = pd.DataFrame(X_rows)
+    y = pd.Series(y_rows, name="target_product")
+    context = pd.DataFrame(
+        {
+            "producer_id": producer_ids,
+            "customer_id": customer_ids,
+        }
+    )
+
+    return X, y, context
+
+
 def compute_metrics(
     y_true: np.ndarray | pd.Series,
     y_pred: np.ndarray | pd.Series,
@@ -167,7 +250,7 @@ def compute_metrics(
 ) -> Dict[str, float]:
     """
     Compute comprehensive evaluation metrics.
-    
+
     Parameters
     ----------
     y_true : array-like
@@ -178,7 +261,7 @@ def compute_metrics(
         Prediction probabilities for ROC-AUC calculation
     average : str, default='weighted'
         Averaging method for multi-class metrics
-        
+
     Returns
     -------
     Dict[str, float]
@@ -190,8 +273,7 @@ def compute_metrics(
         - roc_auc: ROC-AUC score (if y_proba provided)
     """
     metrics = {}
-    
-    # Basic metrics
+
     metrics["accuracy"] = accuracy_score(y_true, y_pred)
     metrics["precision"] = precision_score(
         y_true, y_pred, average=average, zero_division=0
@@ -200,23 +282,17 @@ def compute_metrics(
         y_true, y_pred, average=average, zero_division=0
     )
     metrics["f1"] = f1_score(y_true, y_pred, average=average, zero_division=0)
-    
-    # ROC-AUC for multi-class (one-vs-rest)
+
     if y_proba is not None:
         try:
-            # Get unique classes
             classes = np.unique(y_true)
-            
-            # Binarize labels for multi-class ROC-AUC
             y_true_bin = label_binarize(y_true, classes=classes)
-            
-            # Handle binary classification case
+
             if len(classes) == 2:
                 metrics["roc_auc"] = roc_auc_score(
                     y_true, y_proba[:, 1], average=average
                 )
             else:
-                # Multi-class case
                 metrics["roc_auc"] = roc_auc_score(
                     y_true_bin, y_proba, average=average, multi_class="ovr"
                 )
@@ -225,7 +301,7 @@ def compute_metrics(
             metrics["roc_auc"] = np.nan
     else:
         metrics["roc_auc"] = np.nan
-    
+
     return metrics
 
 
@@ -237,7 +313,7 @@ def print_full_report(
 ) -> None:
     """
     Print detailed classification report.
-    
+
     Parameters
     ----------
     y_true : array-like
@@ -252,7 +328,7 @@ def print_full_report(
     print("\n" + "=" * 80)
     print("CLASSIFICATION REPORT")
     print("=" * 80)
-    
+
     report = classification_report(
         y_true,
         y_pred,
@@ -261,7 +337,7 @@ def print_full_report(
         zero_division=0,
     )
     print(report)
-    
+
     print("=" * 80 + "\n")
 
 
@@ -272,7 +348,7 @@ def get_confusion_matrix(
 ) -> np.ndarray:
     """
     Compute confusion matrix.
-    
+
     Parameters
     ----------
     y_true : array-like
@@ -281,7 +357,7 @@ def get_confusion_matrix(
         Predicted labels
     labels : List[str], optional
         List of label names in order
-        
+
     Returns
     -------
     np.ndarray
@@ -300,7 +376,7 @@ def evaluate_model(
 ) -> Tuple[Dict[str, float], np.ndarray, np.ndarray, np.ndarray]:
     """
     Full model evaluation pipeline.
-    
+
     Parameters
     ----------
     model_path : str | Path
@@ -315,7 +391,7 @@ def evaluate_model(
         Random seed
     verbose : bool, default=True
         Print detailed output
-        
+
     Returns
     -------
     Tuple containing:
@@ -324,32 +400,27 @@ def evaluate_model(
         - y_pred: Predicted labels
         - y_proba: Prediction probabilities
     """
-    # Load model
     model_path = Path(model_path)
     if not model_path.exists():
         raise FileNotFoundError(f"Model not found: {model_path}")
-    
+
     model = joblib.load(model_path)
-    
-    # Load data
+
     orders_df = _load_orders(orders_path)
     class_names = _load_class_names(products_path)
-    
-    # Build dataset
+
     X, y = build_training_dataset(orders_df, class_names)
-    
-    # Filter valid labels
+
     valid_mask = y.isin(class_names)
     X = X.loc[valid_mask].reset_index(drop=True)
     y = y.loc[valid_mask].reset_index(drop=True)
-    
+
     if X.empty or y.empty:
         raise ValueError("Dataset is empty after filtering")
-    
-    # Split data (same as training)
+
     label_counts = y.value_counts()
     can_stratify = (label_counts.min() >= 2) and (y.nunique() > 1)
-    
+
     _, X_test, _, y_test = train_test_split(
         X,
         y,
@@ -357,14 +428,12 @@ def evaluate_model(
         random_state=random_state,
         stratify=y if can_stratify else None,
     )
-    
-    # Predictions
+
     y_pred = model.predict(X_test)
     y_proba = model.predict_proba(X_test) if hasattr(model, "predict_proba") else None
-    
-    # Compute metrics
+
     metrics = compute_metrics(y_test, y_pred, y_proba)
-    
+
     if verbose:
         print("\n" + "=" * 80)
         print("MODEL EVALUATION RESULTS")
@@ -379,18 +448,271 @@ def evaluate_model(
             else:
                 print(f"{metric_name.upper():.<30} N/A")
         print("=" * 80)
-        
-        # Full classification report
+
         print_full_report(y_test, y_pred, target_names=None)
-        
-        # Confusion matrix info
+
         cm = get_confusion_matrix(y_test, y_pred)
         print(f"Confusion Matrix Shape: {cm.shape}")
         print(f"Confusion Matrix Sample (top-left 5x5):")
         print(cm[:5, :5])
         print("=" * 80 + "\n")
-    
+
     return metrics, y_test, y_pred, y_proba
+
+
+# ---------------------------------------------------------------------------
+# AA-21: Bias / Fairness Audit
+# ---------------------------------------------------------------------------
+
+
+def build_predictions_df(
+    model_path: str | Path = DEFAULT_MODEL_PATH,
+    orders_path: str | Path = DEFAULT_ORDERS_PATH,
+    products_path: str | Path = DEFAULT_PRODUCTS_PATH,
+    test_size: float = 0.2,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """
+    Build a predictions dataframe suitable for per-producer fairness auditing.
+
+    Re-runs the same train/test split used by :func:`evaluate_model`, then
+    emits one row per test sample with the ground-truth product, the model's
+    prediction, and the ``producer_id`` of the true order. The producer_id
+    reflects who actually supplied the target product, which is the correct
+    attribution for asking "does the model predict equally accurately
+    across producers?".
+
+    Parameters
+    ----------
+    model_path : str | Path
+        Path to the saved model.
+    orders_path : str | Path
+        Path to orders data (must include ``producer_id``).
+    products_path : str | Path
+        Path to products data.
+    test_size : float, default=0.2
+        Test set proportion. Must match training for a coherent audit.
+    random_state : int, default=42
+        Random seed. Must match training for a coherent audit.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: ``customer_id``, ``producer_id``, ``true_product``,
+        ``predicted_product``, ``is_correct``.
+    """
+    model_path = Path(model_path)
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model not found: {model_path}")
+
+    model = joblib.load(model_path)
+
+    orders_df = _load_orders(orders_path)
+    class_names = _load_class_names(products_path)
+
+    X, y, context = build_training_dataset_with_context(orders_df, class_names)
+
+    valid_mask = y.isin(class_names)
+    X = X.loc[valid_mask].reset_index(drop=True)
+    y = y.loc[valid_mask].reset_index(drop=True)
+    context = context.loc[valid_mask].reset_index(drop=True)
+
+    if X.empty:
+        raise ValueError("Dataset is empty after filtering")
+
+    label_counts = y.value_counts()
+    can_stratify = (label_counts.min() >= 2) and (y.nunique() > 1)
+
+    # Keep context aligned with the test set by splitting indices, not rows
+    indices = np.arange(len(X))
+    _, test_indices = train_test_split(
+        indices,
+        test_size=test_size,
+        random_state=random_state,
+        stratify=y if can_stratify else None,
+    )
+
+    X_test = X.iloc[test_indices].reset_index(drop=True)
+    y_test = y.iloc[test_indices].reset_index(drop=True)
+    context_test = context.iloc[test_indices].reset_index(drop=True)
+
+    y_pred = model.predict(X_test)
+
+    predictions_df = pd.DataFrame(
+        {
+            "customer_id": context_test["customer_id"].astype(str),
+            "producer_id": context_test["producer_id"].astype(str),
+            "true_product": y_test.astype(str).values,
+            "predicted_product": pd.Series(y_pred).astype(str).values,
+        }
+    )
+    predictions_df["is_correct"] = (
+        predictions_df["true_product"] == predictions_df["predicted_product"]
+    )
+
+    return predictions_df
+
+
+def bias_audit(
+    predictions_df: pd.DataFrame,
+    flag_multiplier: float = BIAS_FLAG_MULTIPLIER,
+) -> Dict:
+    """
+    Group predictions by producer and flag potentially biased outcomes.
+
+    For each producer this computes:
+        - ``precision``: fraction of test samples originating from that
+          producer where the model predicted the correct product.
+        - ``recommendation_rate``: that producer's share of the total
+          test-set attributions.
+        - ``sample_count``: how many test samples belong to that producer.
+
+    A producer is flagged if its recommendation rate exceeds the cross-producer
+    mean by more than ``(flag_multiplier - 1) * 100`` percent (default: 20%).
+    Using recommendation_rate specifically tests for **over-representation**
+    (favouritism), as required by the Jira specification.
+
+    Parameters
+    ----------
+    predictions_df : pd.DataFrame
+        Must contain ``producer_id``, ``true_product``, ``predicted_product``,
+        and ``is_correct`` columns (as produced by :func:`build_predictions_df`).
+    flag_multiplier : float, default=1.20
+        Multiplier of the mean recommendation rate above which a producer
+        is flagged.
+
+    Returns
+    -------
+    Dict
+        ``{
+            "per_producer": DataFrame,
+            "mean_recommendation_rate": float,
+            "flag_threshold": float,
+            "flagged_producers": List[str],
+        }``
+
+    Raises
+    ------
+    ValueError
+        If required columns are missing from ``predictions_df``.
+    """
+    required = {"producer_id", "true_product", "predicted_product", "is_correct"}
+    missing = required - set(predictions_df.columns)
+    if missing:
+        raise ValueError(
+            f"predictions_df is missing required columns: {sorted(missing)}"
+        )
+
+    if predictions_df.empty:
+        return {
+            "per_producer": pd.DataFrame(
+                columns=[
+                    "producer_id",
+                    "sample_count",
+                    "precision",
+                    "recommendation_rate",
+                    "flagged",
+                ]
+            ),
+            "mean_recommendation_rate": 0.0,
+            "flag_threshold": 0.0,
+            "flagged_producers": [],
+        }
+
+    total_samples = len(predictions_df)
+
+    per_producer = (
+        predictions_df.groupby("producer_id", as_index=False)
+        .agg(
+            sample_count=("producer_id", "count"),
+            correct_count=("is_correct", "sum"),
+        )
+    )
+
+    per_producer["precision"] = (
+        per_producer["correct_count"] / per_producer["sample_count"]
+    )
+    per_producer["recommendation_rate"] = (
+        per_producer["sample_count"] / total_samples
+    )
+
+    mean_rec_rate = per_producer["recommendation_rate"].mean()
+    flag_threshold = mean_rec_rate * flag_multiplier
+    per_producer["flagged"] = per_producer["recommendation_rate"] > flag_threshold
+
+    flagged_producers = per_producer.loc[
+        per_producer["flagged"], "producer_id"
+    ].tolist()
+
+    per_producer = per_producer.sort_values(
+        "recommendation_rate", ascending=False
+    ).reset_index(drop=True)
+
+    return {
+        "per_producer": per_producer[
+            [
+                "producer_id",
+                "sample_count",
+                "precision",
+                "recommendation_rate",
+                "flagged",
+            ]
+        ],
+        "mean_recommendation_rate": float(mean_rec_rate),
+        "flag_threshold": float(flag_threshold),
+        "flagged_producers": flagged_producers,
+    }
+
+
+def print_bias_audit(audit_result: Dict) -> None:
+    """
+    Print a human-readable summary of a bias audit result.
+
+    Parameters
+    ----------
+    audit_result : Dict
+        The dictionary returned by :func:`bias_audit`.
+    """
+    print("\n" + "=" * 80)
+    print("BIAS / FAIRNESS AUDIT (per producer)")
+    print("=" * 80)
+
+    per_producer = audit_result["per_producer"]
+    if per_producer.empty:
+        print("No predictions to audit.")
+        print("=" * 80 + "\n")
+        return
+
+    print(
+        f"Mean recommendation rate across producers: "
+        f"{audit_result['mean_recommendation_rate']:.4f}"
+    )
+    print(
+        f"Flag threshold (mean x {BIAS_FLAG_MULTIPLIER:.2f}): "
+        f"{audit_result['flag_threshold']:.4f}"
+    )
+    print("-" * 80)
+
+    for _, row in per_producer.iterrows():
+        marker = "  FLAGGED" if row["flagged"] else ""
+        print(
+            f"{row['producer_id']:<10} "
+            f"samples={int(row['sample_count']):<5} "
+            f"precision={row['precision']:.4f}   "
+            f"rec_rate={row['recommendation_rate']:.4f}"
+            f"{marker}"
+        )
+
+    print("-" * 80)
+    if audit_result["flagged_producers"]:
+        print(
+            f"Flagged producers (rec_rate >"
+            f" {audit_result['flag_threshold']:.4f}): "
+            f"{audit_result['flagged_producers']}"
+        )
+    else:
+        print("No producers exceeded the flag threshold.")
+    print("=" * 80 + "\n")
 
 
 if __name__ == "__main__":
@@ -398,6 +720,12 @@ if __name__ == "__main__":
     try:
         metrics, y_test, y_pred, y_proba = evaluate_model(verbose=True)
         print("\nEvaluation completed successfully!")
+
+        # Bias audit
+        predictions_df = build_predictions_df()
+        audit_result = bias_audit(predictions_df)
+        print_bias_audit(audit_result)
+
     except FileNotFoundError as e:
         print(f"\nError: {e}")
         print("Please train the model first using: python -m task1_purchase_prediction.src.model")

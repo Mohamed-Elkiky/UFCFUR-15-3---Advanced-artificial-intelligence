@@ -1,9 +1,14 @@
 """
-Tests for Task 1 Purchase Prediction (AA-17).
+Tests for Task 1 Purchase Prediction (AA-17 and AA-21).
 
-Covers the two functions required by AA-17:
+Covers:
+    AA-17:
     - ``get_quick_reorder``: frequency-based top-N reorder suggestions
     - ``predict_reorder``:   model-based top-N next-product predictions
+
+    AA-21:
+    - ``bias_audit``: per-producer precision & recommendation-rate audit
+    - ``build_predictions_df``: test-set predictions with producer context
 
 Tests use synthetic in-memory data written to a ``tmp_path`` fixture so
 they are isolated from the real dataset and trained model.
@@ -18,6 +23,10 @@ import pandas as pd
 import pytest
 from sklearn.ensemble import RandomForestClassifier
 
+from task1_purchase_prediction.src.evaluate import (
+    bias_audit,
+    build_predictions_df,
+)
 from task1_purchase_prediction.src.predict import (
     get_quick_reorder,
     predict_reorder,
@@ -71,11 +80,9 @@ def trained_model_artifacts(tmp_path: Path, sample_orders: pd.DataFrame):
     """Train a tiny classifier on the sample data and save it to tmp."""
     class_names = ["Milk", "Bread", "Apples", "Cheese"]
 
-    # Build a minimal training set: one feature row per customer
     training_rows = []
     labels = []
-    for customer_id, group in sample_orders.groupby("customer_id"):
-        # Use all-but-last as history, last product as label
+    for _, group in sample_orders.groupby("customer_id"):
         history = group.iloc[:-1]
         label = group.iloc[-1]["product"]
         row = history_to_feature_row(history, class_names)
@@ -210,3 +217,135 @@ def test_predict_reorder_result_schema(
     for item in results:
         assert set(item.keys()) == {"product", "confidence_score"}
         assert 0.0 <= item["confidence_score"] <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# bias_audit (AA-21)
+# ---------------------------------------------------------------------------
+
+def test_bias_audit_computes_precision_per_producer():
+    """Per-producer precision equals correct_count / sample_count."""
+    predictions_df = pd.DataFrame(
+        [
+            # PROD001: 3 samples, 2 correct -> precision 2/3
+            {"producer_id": "PROD001", "true_product": "A",
+             "predicted_product": "A", "is_correct": True},
+            {"producer_id": "PROD001", "true_product": "A",
+             "predicted_product": "A", "is_correct": True},
+            {"producer_id": "PROD001", "true_product": "A",
+             "predicted_product": "B", "is_correct": False},
+            # PROD002: 2 samples, 0 correct -> precision 0
+            {"producer_id": "PROD002", "true_product": "B",
+             "predicted_product": "A", "is_correct": False},
+            {"producer_id": "PROD002", "true_product": "B",
+             "predicted_product": "C", "is_correct": False},
+        ]
+    )
+
+    result = bias_audit(predictions_df)
+    per_producer = result["per_producer"].set_index("producer_id")
+
+    assert per_producer.loc["PROD001", "precision"] == pytest.approx(2 / 3)
+    assert per_producer.loc["PROD002", "precision"] == 0.0
+
+
+def test_bias_audit_computes_recommendation_rate():
+    """Recommendation rate is each producer's share of total samples."""
+    predictions_df = pd.DataFrame(
+        [
+            {"producer_id": "PROD001", "true_product": "A",
+             "predicted_product": "A", "is_correct": True},
+            {"producer_id": "PROD001", "true_product": "A",
+             "predicted_product": "A", "is_correct": True},
+            {"producer_id": "PROD001", "true_product": "A",
+             "predicted_product": "A", "is_correct": True},
+            {"producer_id": "PROD002", "true_product": "B",
+             "predicted_product": "B", "is_correct": True},
+        ]
+    )
+
+    result = bias_audit(predictions_df)
+    per_producer = result["per_producer"].set_index("producer_id")
+
+    # PROD001 has 3/4 of samples, PROD002 has 1/4
+    assert per_producer.loc["PROD001", "recommendation_rate"] == pytest.approx(0.75)
+    assert per_producer.loc["PROD002", "recommendation_rate"] == pytest.approx(0.25)
+
+
+def test_bias_audit_flags_producers_above_threshold():
+    """A producer >20% above the mean recommendation rate must be flagged."""
+    # Four producers with shares 0.60 / 0.20 / 0.10 / 0.10
+    # Mean = 0.25, threshold = 0.30, so only the 0.60 producer should be flagged.
+    predictions_df = pd.DataFrame(
+        [{"producer_id": "PROD001", "true_product": "X",
+          "predicted_product": "X", "is_correct": True}] * 6
+        + [{"producer_id": "PROD002", "true_product": "X",
+            "predicted_product": "X", "is_correct": True}] * 2
+        + [{"producer_id": "PROD003", "true_product": "X",
+            "predicted_product": "X", "is_correct": True}] * 1
+        + [{"producer_id": "PROD004", "true_product": "X",
+            "predicted_product": "X", "is_correct": True}] * 1
+    )
+
+    result = bias_audit(predictions_df)
+
+    assert result["flagged_producers"] == ["PROD001"]
+    assert result["mean_recommendation_rate"] == pytest.approx(0.25)
+    assert result["flag_threshold"] == pytest.approx(0.30)
+
+
+def test_bias_audit_flags_nothing_when_rates_are_balanced():
+    """Equal rec rates across producers must produce no flags."""
+    predictions_df = pd.DataFrame(
+        [{"producer_id": f"PROD00{i}", "true_product": "X",
+          "predicted_product": "X", "is_correct": True}
+         for i in range(1, 5)] * 10  # 10 samples per producer -> perfectly balanced
+    )
+
+    result = bias_audit(predictions_df)
+
+    assert result["flagged_producers"] == []
+
+
+def test_bias_audit_empty_input_returns_empty_structure():
+    """An empty predictions_df must return a valid empty audit result."""
+    predictions_df = pd.DataFrame(
+        columns=["producer_id", "true_product", "predicted_product", "is_correct"]
+    )
+
+    result = bias_audit(predictions_df)
+
+    assert result["flagged_producers"] == []
+    assert result["mean_recommendation_rate"] == 0.0
+    assert result["per_producer"].empty
+
+
+def test_bias_audit_rejects_missing_columns():
+    """Missing required columns must raise a descriptive ValueError."""
+    predictions_df = pd.DataFrame({"producer_id": ["PROD001"]})
+
+    with pytest.raises(ValueError, match="missing required columns"):
+        bias_audit(predictions_df)
+
+
+def test_bias_audit_respects_custom_flag_multiplier():
+    """A stricter multiplier should flag more producers."""
+    # Same setup as test_bias_audit_flags_producers_above_threshold, but
+    # multiplier 1.00 means any producer above the mean gets flagged.
+    predictions_df = pd.DataFrame(
+        [{"producer_id": "PROD001", "true_product": "X",
+          "predicted_product": "X", "is_correct": True}] * 6
+        + [{"producer_id": "PROD002", "true_product": "X",
+            "predicted_product": "X", "is_correct": True}] * 2
+        + [{"producer_id": "PROD003", "true_product": "X",
+            "predicted_product": "X", "is_correct": True}] * 1
+        + [{"producer_id": "PROD004", "true_product": "X",
+            "predicted_product": "X", "is_correct": True}] * 1
+    )
+
+    strict = bias_audit(predictions_df, flag_multiplier=1.00)
+
+    # With multiplier 1.00, threshold = mean = 0.25.
+    # PROD001 (0.60) and PROD002 (0.20 — actually below) are tested.
+    # Only PROD001 (0.60) is strictly above 0.25.
+    assert "PROD001" in strict["flagged_producers"]
