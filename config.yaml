@@ -1,5 +1,4 @@
 task2_3_4_cv_quality:
-task2_3_4_cv_quality:
   data_root: task2_3_4_cv_quality/data/raw/Fruit And Vegetable Diseases Dataset
   train_dir: task2_3_4_cv_quality/data/raw/Fruit And Vegetable Diseases Dataset
   test_dir: task2_3_4_cv_quality/data/raw/Fruit And Vegetable Diseases Dataset
@@ -11,3 +10,17 @@ task2_3_4_cv_quality:
   num_workers: 0
   random_seed: 42
   imbalance_threshold: 0.7
+
+grading_thresholds:
+  # Grade A: awarded only when all three scores meet or exceed these values.
+  grade_a:
+    color: 75
+    size: 80
+    ripeness: 70
+  # Grade B: fallback when any score drops below a Grade A threshold but all
+  # three still meet or exceed these lower values. Otherwise the produce
+  # is assigned Grade C.
+  grade_b:
+    color: 65
+    size: 70
+    ripeness: 60
