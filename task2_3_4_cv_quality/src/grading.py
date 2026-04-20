@@ -311,6 +311,14 @@ def _meets_thresholds(
     return True
 
 
+def _get_weakest_dimension(scores: Mapping[str, Any]) -> tuple[str, int]:
+    """Return the weakest quality dimension and its score."""
+    weakest_key = min(REQUIRED_SCORE_KEYS, key=lambda key: scores[key])
+    weakest_dimension = weakest_key.replace("_score", "")
+    weakest_value = int(scores[weakest_key])
+    return weakest_dimension, weakest_value
+
+
 def assign_grade(
     scores: Mapping[str, Any],
     thresholds: Mapping[str, Mapping[str, float]] | None = None,
@@ -338,22 +346,7 @@ def assign_grade(
     Returns
     -------
     str
-        ``"A"``, ``"B"`` or ``"C"``.
-
-    Raises
-    ------
-    ValueError
-        If ``scores`` is missing a required key, contains a non-numeric
-        value, or contains a value outside the 0-100 range.
-
-    Examples
-    --------
-    >>> assign_grade({"color_score": 85, "size_score": 90, "ripeness_score": 80})
-    'A'
-    >>> assign_grade({"color_score": 70, "size_score": 75, "ripeness_score": 65})
-    'B'
-    >>> assign_grade({"color_score": 50, "size_score": 40, "ripeness_score": 30})
-    'C'
+        ``"A"``, ``"B"``, or ``"C"``.
     """
     _validate_scores(scores)
 
@@ -371,80 +364,144 @@ def assign_grade(
 # End-to-end pipeline (AA-29)
 # ---------------------------------------------------------------------------
 
-def get_recommendation(grade: str) -> str:
-    """Get business recommendation for a grade.
+def get_recommendation(
+    grade: str,
+    scores: Mapping[str, Any] | None = None,
+) -> str:
+    """Get producer-facing recommendation text for a grade.
 
     Parameters
     ----------
     grade : str
         ``"A"``, ``"B"`` or ``"C"``.
+    scores : Mapping[str, Any], optional
+        Mapping containing ``color_score``, ``size_score`` and
+        ``ripeness_score``. When provided, Grade B and C messages
+        include the weakest score dimension.
 
     Returns
     -------
     str
-        Business recommendation text.
-
-    Examples
-    --------
-    >>> get_recommendation("A")
-    'Premium quality - sell at full price in premium display'
+        Business recommendation text tailored to the grade.
     """
     grade = grade.strip().upper()
-    if grade not in RECOMMENDATIONS:
+
+    if grade == "A":
+        return "Premium quality - sell at full price in premium display"
+
+    if grade not in {"B", "C"}:
         raise ValueError(
             f"Unknown grade: '{grade}'. Expected 'A', 'B', or 'C'."
         )
-    return RECOMMENDATIONS[grade]
+
+    if scores is None:
+        if grade == "B":
+            return "Standard quality - recommend 20% discount."
+        return "Low quality - recommend 35% discount or removal from sale."
+
+    _validate_scores(scores)
+    weakest_dimension, weakest_value = _get_weakest_dimension(scores)
+
+    if grade == "B":
+        return (
+            f"Standard quality - {weakest_dimension} is the weakest area "
+            f"({weakest_value}%). Recommend 20% discount."
+        )
+
+    return (
+        f"Low quality - {weakest_dimension} is the weakest area "
+        f"({weakest_value}%). Recommend 35% discount or removal from sale."
+    )
+
+
+def update_inventory_action(
+    grade: str,
+    producer_id: str,
+    product: str,
+    quantity: int,
+) -> Dict[str, Any]:
+    """Return the inventory action to take after a quality prediction.
+
+    Parameters
+    ----------
+    grade : str
+        Produce quality grade: ``"A"``, ``"B"`` or ``"C"``.
+    producer_id : str
+        Identifier of the producer whose stock is being updated.
+    product : str
+        Product name.
+    quantity : int
+        Current stock quantity.
+
+    Returns
+    -------
+    Dict[str, Any]
+        Inventory action payload containing:
+        - ``action``: one of ``"list_full_price"``, ``"apply_discount"``,
+          ``"remove_listing"``
+        - ``discount_pct``: one of ``0``, ``20``, ``35``
+        - ``producer_id``
+    """
+    grade = grade.strip().upper()
+
+    if quantity < 0:
+        raise ValueError(f"quantity must be >= 0, got {quantity}")
+
+    if grade == "A":
+        action = "list_full_price"
+        discount_pct = 0
+    elif grade == "B":
+        action = "apply_discount"
+        discount_pct = 20
+    elif grade == "C":
+        if quantity <= 10:
+            action = "remove_listing"
+            discount_pct = 0
+        else:
+            action = "apply_discount"
+            discount_pct = 35
+    else:
+        raise ValueError(
+            f"Unknown grade: '{grade}'. Expected 'A', 'B', or 'C'."
+        )
+
+    return {
+        "producer_id": producer_id,
+        "product": product,
+        "quantity": quantity,
+        "grade": grade,
+        "action": action,
+        "discount_pct": discount_pct,
+    }
 
 
 def grade_produce(
     model_output: Mapping[str, Any],
     thresholds: Mapping[str, Mapping[str, float]] | None = None,
+    producer_id: str | None = None,
+    product: str | None = None,
+    quantity: int | None = None,
 ) -> Dict[str, Any]:
-    """End-to-end: Model output -> Quality scores -> Grade -> Recommendation.
-
-    Complete pipeline for grading produce from model predictions.
-
-    Parameters
-    ----------
-    model_output : Mapping[str, Any]
-        Dictionary with:
-        - ``predicted_class``: str (e.g., ``"Apple__Healthy"``)
-        - ``confidence``: float in ``[0, 1]``
-    thresholds : Mapping[str, Mapping[str, float]], optional
-        Pre-loaded thresholds in the shape returned by
-        :func:`load_thresholds`. If omitted, thresholds are loaded from
-        the default config file.
-
-    Returns
-    -------
-    Dict[str, Any]
-        Complete grading result with:
-        - ``predicted_class``, ``produce_type``, ``state``, ``confidence``
-        - ``color_score``, ``size_score``, ``ripeness_score``
-        - ``grade``
-        - ``recommendation``
-
-    Examples
-    --------
-    >>> model_output = {"predicted_class": "Apple__Healthy", "confidence": 0.95}
-    >>> result = grade_produce(model_output)
-    >>> result['grade']
-    'A'
-    >>> model_output = {"predicted_class": "Banana__Rotten", "confidence": 0.85}
-    >>> result = grade_produce(model_output)
-    >>> result['grade']
-    'C'
-    """
+    """End-to-end: Model output -> Quality scores -> Grade -> Recommendation."""
     scores = compute_quality_scores(model_output)
     grade = assign_grade(scores, thresholds=thresholds)
-    recommendation = get_recommendation(grade)
+    recommendation = get_recommendation(grade, scores)
 
-    return {
+    result = {
         **scores,
         "grade": grade,
         "recommendation": recommendation,
     }
+
+    if producer_id is not None and product is not None and quantity is not None:
+        result["inventory_action"] = update_inventory_action(
+            grade=grade,
+            producer_id=producer_id,
+            product=product,
+            quantity=quantity,
+        )
+
+    return result
 
 
 if __name__ == "__main__":
