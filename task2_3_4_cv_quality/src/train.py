@@ -247,19 +247,14 @@ def create_dataloaders(
     )
 
 
-if __name__ == "__main__":
-    create_dataloaders()
-    # ... [Keep all your existing code above - don't remove anything!] ...
-
 # ============================================================================
 # TRAINING PIPELINE
 # ============================================================================
 
-import torch
+import json
 import torch.nn as nn
 import torch.optim as optim
-from pathlib import Path
-from typing import Dict, Optional
+from datetime import datetime
 from tqdm.auto import tqdm
 
 
@@ -576,6 +571,24 @@ def train_model(
     print(f"Model saved to:           {best_model_path}")
     print("="*80)
     
+    # AA-38: Save metadata JSON alongside the model
+    metadata = {
+        "model_type": model_type,
+        "epochs_trained": num_epochs,
+        "best_epoch": best_checkpoint['epoch'],
+        "val_accuracy": best_val_acc,
+        "test_accuracy": test_acc,
+        "learning_rate": learning_rate,
+        "weight_decay": weight_decay,
+        "num_classes": len(classes),
+        "classes": classes,
+        "date_trained": datetime.now().isoformat(),
+    }
+    metadata_path = save_dir / f"{model_type}_metadata.json"
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    print(f"Metadata saved to: {metadata_path}")
+    
     return {
         'history': history,
         'best_val_acc': best_val_acc,
@@ -587,73 +600,83 @@ def train_model(
     }
 
 
+# ============================================================================
+# CLI ENTRY POINT
+# ============================================================================
+
+
 def main():
     """Main entry point for command-line training."""
     import argparse
-    
+
+    # Load config defaults so CLI flags override them
+    cfg = load_config()
+
     parser = argparse.ArgumentParser(
         description="Train CV quality grading model",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    
+
     parser.add_argument(
-        '--model',
-        type=str,
-        default='custom_cnn',
+        '--model', type=str,
+        default=cfg.get("model_type", "custom_cnn"),
         choices=['custom_cnn', 'resnet50', 'efficientnet_b0', 'mobilenet_v3_small'],
         help='Model architecture to train'
     )
     parser.add_argument(
-        '--epochs',
-        type=int,
-        default=20,
+        '--epochs', type=int,
+        default=cfg.get("epochs", 20),
         help='Number of training epochs'
     )
     parser.add_argument(
-        '--lr',
-        type=float,
-        default=0.001,
+        '--batch-size', type=int,
+        default=cfg.get("batch_size", 32),
+        help='Training batch size'
+    )
+    parser.add_argument(
+        '--lr', type=float,
+        default=cfg.get("learning_rate", 0.001),
         help='Initial learning rate'
     )
     parser.add_argument(
-        '--weight-decay',
-        type=float,
-        default=0.0001,
+        '--weight-decay', type=float,
+        default=cfg.get("weight_decay", 0.0001),
         help='L2 regularization strength'
     )
     parser.add_argument(
-        '--step-size',
-        type=int,
-        default=10,
+        '--step-size', type=int,
+        default=cfg.get("step_size", 10),
         help='StepLR scheduler step size'
     )
     parser.add_argument(
-        '--gamma',
-        type=float,
-        default=0.5,
+        '--gamma', type=float,
+        default=cfg.get("gamma", 0.5),
         help='StepLR scheduler gamma'
     )
     parser.add_argument(
-        '--save-dir',
-        type=str,
+        '--save-dir', type=str,
         default=None,
         help='Directory to save models (default: models/)'
     )
-    
+
     args = parser.parse_args()
-    
-    print("="*80)
+
+    # Override batch_size in config so create_dataloaders picks it up
+    cfg["batch_size"] = args.batch_size
+
+    print("=" * 80)
     print("CV QUALITY GRADING - MODEL TRAINING")
-    print("="*80)
+    print("=" * 80)
     print(f"Model:        {args.model}")
     print(f"Epochs:       {args.epochs}")
+    print(f"Batch Size:   {args.batch_size}")
     print(f"Learning Rate: {args.lr}")
     print(f"Weight Decay: {args.weight_decay}")
     print(f"Scheduler:    StepLR (step={args.step_size}, gamma={args.gamma})")
-    print("="*80)
-    
+    print("=" * 80)
+
     save_dir = Path(args.save_dir) if args.save_dir else None
-    
+
     results = train_model(
         model_type=args.model,
         num_epochs=args.epochs,
@@ -661,9 +684,10 @@ def main():
         weight_decay=args.weight_decay,
         step_size=args.step_size,
         gamma=args.gamma,
+        config=cfg,
         save_dir=save_dir,
     )
-    
+
     print("\n✓ Training completed successfully!")
     print(f"✓ Best model saved to: {results['model_path']}")
 

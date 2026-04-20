@@ -11,6 +11,24 @@ task2_3_4_cv_quality:
   random_seed: 42
   imbalance_threshold: 0.7
 
+# Training defaults
+  model_type: resnet50
+  epochs: 20
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  dropout: 0.5
+  step_size: 10
+  gamma: 0.5
+ 
+  # Augmentation flags
+  augmentation:
+    horizontal_flip: true
+    vertical_flip: false
+    rotation_degrees: 15
+    color_jitter: true
+    random_crop: false
+
+
 grading_thresholds:
   # Grade A: awarded only when all three scores meet or exceed these values.
   grade_a:
