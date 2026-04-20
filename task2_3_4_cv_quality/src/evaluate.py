@@ -470,6 +470,132 @@ def print_results_table(
 # Demo
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# AA-34: Plotting — confusion matrix heatmap & per-class F1 bar chart
+# ---------------------------------------------------------------------------
+
+
+def plot_confusion_matrix(
+    result: "EvaluationResult",
+    normalize: str = "true",
+    save_path: Optional[str] = None,
+    figsize: Optional[Tuple[int, int]] = None,
+):
+    """Seaborn heatmap of the confusion matrix, optionally saved to file."""
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    labels = list(range(len(result.class_names)))
+    cm = confusion_matrix(result.y_true, result.y_pred, labels=labels, normalize=normalize)
+
+    n = len(result.class_names)
+    if figsize is None:
+        figsize = (max(10, n * 0.55), max(8, n * 0.45))
+
+    fig, ax = plt.subplots(figsize=figsize)
+    fmt = ".2f" if normalize else "d"
+    sns.heatmap(
+        cm, annot=True, fmt=fmt, cmap="Blues",
+        xticklabels=result.class_names,
+        yticklabels=result.class_names,
+        linewidths=0.5, linecolor="white",
+        cbar_kws={"shrink": 0.8}, ax=ax,
+    )
+    ax.set_xlabel("Predicted", fontsize=12)
+    ax.set_ylabel("True", fontsize=12)
+    ax.set_title("Confusion Matrix", fontsize=14, fontweight="bold")
+    plt.xticks(rotation=45, ha="right", fontsize=8)
+    plt.yticks(rotation=0, fontsize=8)
+    plt.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+
+
+def plot_per_class_metrics(
+    metrics: "MetricsResult",
+    metric: str = "f1",
+    save_path: Optional[str] = None,
+):
+    """Horizontal bar chart of a per-class metric (default: F1)."""
+    import matplotlib.pyplot as plt
+
+    names = list(metrics.per_class.keys())
+    values = [metrics.per_class[n][metric] for n in names]
+
+    sorted_pairs = sorted(zip(values, names))
+    values, names = zip(*sorted_pairs)
+
+    fig, ax = plt.subplots(figsize=(10, max(6, len(names) * 0.3)))
+
+    colors = ["#e74c3c" if v < 0.9 else "#f39c12" if v < 0.95 else "#2ecc71" for v in values]
+    ax.barh(names, values, color=colors, edgecolor="black", linewidth=0.5)
+
+    ax.set_xlabel(metric.upper(), fontsize=12)
+    ax.set_title(f"Per-Class {metric.upper()} Score", fontsize=14, fontweight="bold")
+    ax.set_xlim(min(values) * 0.95, 1.0)
+    ax.grid(axis="x", alpha=0.3)
+    plt.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+
+
+# ---------------------------------------------------------------------------
+# AA-35: Failure case analysis
+# ---------------------------------------------------------------------------
+
+
+def analyse_failures(
+    model: nn.Module,
+    dataloader: DataLoader,
+    class_names: Sequence[str],
+    device: Union[str, torch.device],
+    max_per_class: int = 5,
+) -> Dict[str, List[Dict]]:
+    """Collect misclassified images grouped by true class.
+
+    Returns dict mapping true class name -> list of dicts with keys:
+    image (Tensor), true_label, pred_label, confidence.
+    """
+    model.eval()
+    failures: Dict[str, List[Dict]] = {name: [] for name in class_names}
+
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+    with torch.no_grad():
+        for images, labels in dataloader:
+            images_dev, labels_dev = images.to(device), labels.to(device)
+            outputs = model(images_dev)
+            probs = torch.softmax(outputs, dim=1)
+            confs, preds = probs.max(dim=1)
+
+            wrong = preds != labels_dev
+            if not wrong.any():
+                continue
+
+            for idx in wrong.nonzero(as_tuple=True)[0]:
+                true_cls = class_names[labels[idx].item()]
+                if len(failures[true_cls]) >= max_per_class:
+                    continue
+
+                img = images[idx].cpu() * std + mean
+                img = img.clamp(0, 1)
+
+                failures[true_cls].append({
+                    "image": img,
+                    "true_label": true_cls,
+                    "pred_label": class_names[preds[idx].item()],
+                    "confidence": confs[idx].item(),
+                })
+
+    # Remove classes with no failures
+    return {k: v for k, v in failures.items() if v}
+
+
 if __name__ == "__main__":
     # Small self-contained demo using synthetic labels so the module can
     # be smoke-tested without needing a trained checkpoint.
