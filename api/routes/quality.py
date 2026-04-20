@@ -74,7 +74,7 @@ def predict_quality():
         prediction=predicted_class,
         confidence=conf,
         grade=result["grade"],
-        input_hash=img_hash,
+        input_summary=img_hash,
         metadata={"color": result["color_score"],
                   "size": result["size_score"],
                   "ripeness": result["ripeness_score"]},

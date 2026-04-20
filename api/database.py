@@ -14,14 +14,16 @@ def _get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_PATH))
     conn.execute(
         """CREATE TABLE IF NOT EXISTS interactions (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            endpoint    TEXT NOT NULL,
-            input_hash  TEXT,
-            prediction  TEXT,
-            confidence  REAL,
-            grade       TEXT,
-            metadata    TEXT,
-            created_at  TEXT NOT NULL
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp       TEXT NOT NULL,
+            user_id         TEXT,
+            endpoint        TEXT NOT NULL,
+            input_summary   TEXT,
+            prediction      TEXT,
+            confidence      REAL,
+            grade           TEXT,
+            was_overridden  INTEGER DEFAULT 0,
+            metadata        TEXT
         )"""
     )
     conn.commit()
@@ -33,22 +35,27 @@ def log_interaction(
     prediction: str,
     confidence: Optional[float] = None,
     grade: Optional[str] = None,
-    input_hash: Optional[str] = None,
+    user_id: Optional[str] = None,
+    input_summary: Optional[str] = None,
+    was_overridden: bool = False,
     metadata: Optional[Dict] = None,
 ) -> int:
     conn = _get_conn()
     cur = conn.execute(
         """INSERT INTO interactions
-           (endpoint, input_hash, prediction, confidence, grade, metadata, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+           (timestamp, user_id, endpoint, input_summary, prediction,
+            confidence, grade, was_overridden, metadata)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
+            datetime.now().isoformat(),
+            user_id,
             endpoint,
-            input_hash,
+            input_summary,
             prediction,
             confidence,
             grade,
+            int(was_overridden),
             json.dumps(metadata) if metadata else None,
-            datetime.now().isoformat(),
         ),
     )
     conn.commit()
@@ -62,6 +69,17 @@ def get_all_interactions() -> List[Dict]:
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         "SELECT * FROM interactions ORDER BY id DESC"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_by_user(user_id: str) -> List[Dict]:
+    conn = _get_conn()
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM interactions WHERE user_id = ? ORDER BY id DESC",
+        (user_id,),
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]

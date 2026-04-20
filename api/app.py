@@ -17,6 +17,7 @@ from api.config import (
     REORDER_CLASS_NAMES_FILE,
     REORDER_MODEL_FILE,
 )
+from api.middleware.logger import register_logger
 from api.routes import register_routes
 
 
@@ -53,8 +54,6 @@ def _load_quality_model(app: Flask) -> None:
 
 def _load_reorder_model(app: Flask) -> None:
     """Load the Task 1 reorder model into app.config."""
-    import joblib
-
     from task1_purchase_prediction.src.predict import predict_reorder
 
     model_path = Path(REORDER_MODEL_FILE)
@@ -75,6 +74,7 @@ def create_app() -> Flask:
         return jsonify({"status": "ok"})
 
     register_routes(app)
+    register_logger(app)
 
     with app.app_context():
         _load_quality_model(app)
