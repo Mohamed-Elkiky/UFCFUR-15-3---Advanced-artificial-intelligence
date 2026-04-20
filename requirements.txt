@@ -33,3 +33,6 @@ captum>=0.6.0
 
 # API / Web Service
 flask>=3.0.0
+
+# Testing
+pytest>=8.0.0
