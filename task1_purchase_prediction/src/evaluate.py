@@ -43,6 +43,11 @@ REQUIRED_COLUMNS = {"customer_id", "product", "quantity", "order_date"}
 # flagged as potentially over-represented in the model's predictions.
 BIAS_FLAG_MULTIPLIER = 1.20
 
+# AA-50: standard-deviation multiplier for the updated bias flagging logic.
+# Producers whose recommendation rate is more than STD_FLAG_THRESHOLD standard
+# deviations above the cross-producer mean are flagged.
+STD_FLAG_THRESHOLD = 1.5
+
 
 def _load_orders(orders_path: str | Path = DEFAULT_ORDERS_PATH) -> pd.DataFrame:
     """Load and validate orders data."""
@@ -556,30 +561,36 @@ def build_predictions_df(
 def bias_audit(
     predictions_df: pd.DataFrame,
     flag_multiplier: float = BIAS_FLAG_MULTIPLIER,
+    std_threshold: float = STD_FLAG_THRESHOLD,
 ) -> Dict:
     """
-    Group predictions by producer and flag potentially biased outcomes.
+    Group predictions by producer and flag potentially biased outcomes (AA-50).
 
     For each producer this computes:
-        - ``precision``: fraction of test samples originating from that
-          producer where the model predicted the correct product.
-        - ``recommendation_rate``: that producer's share of the total
-          test-set attributions.
+        - ``precision``: fraction of test samples where the model was correct.
+        - ``recommendation_rate``: that producer's share of all test samples.
+        - ``avg_confidence``: mean model confidence for that producer's samples
+          (requires a ``confidence`` column; set to NaN if absent).
+        - ``deviation``: how many standard deviations the producer's
+          recommendation rate is above the cross-producer mean.
         - ``sample_count``: how many test samples belong to that producer.
 
-    A producer is flagged if its recommendation rate exceeds the cross-producer
-    mean by more than ``(flag_multiplier - 1) * 100`` percent (default: 20%).
-    Using recommendation_rate specifically tests for **over-representation**
-    (favouritism), as required by the Jira specification.
+    A producer is flagged when its recommendation rate is more than
+    ``std_threshold`` standard deviations above the cross-producer mean
+    (AA-50 requirement). The legacy ``flag_multiplier`` threshold is retained
+    as a secondary check and stored separately in the returned dict.
 
     Parameters
     ----------
     predictions_df : pd.DataFrame
         Must contain ``producer_id``, ``true_product``, ``predicted_product``,
         and ``is_correct`` columns (as produced by :func:`build_predictions_df`).
+        An optional ``confidence`` column is used for avg_confidence when present.
     flag_multiplier : float, default=1.20
-        Multiplier of the mean recommendation rate above which a producer
-        is flagged.
+        Legacy multiplier threshold (kept for backwards compatibility).
+    std_threshold : float, default=1.5
+        Number of standard deviations above the mean at which a producer is
+        flagged (AA-50 primary criterion).
 
     Returns
     -------
@@ -587,7 +598,9 @@ def bias_audit(
         ``{
             "per_producer": DataFrame,
             "mean_recommendation_rate": float,
-            "flag_threshold": float,
+            "std_recommendation_rate": float,
+            "flag_threshold_std": float,
+            "flag_threshold_multiplier": float,
             "flagged_producers": List[str],
         }``
 
@@ -611,22 +624,30 @@ def bias_audit(
                     "sample_count",
                     "precision",
                     "recommendation_rate",
+                    "avg_confidence",
+                    "deviation",
                     "flagged",
                 ]
             ),
             "mean_recommendation_rate": 0.0,
-            "flag_threshold": 0.0,
+            "std_recommendation_rate": 0.0,
+            "flag_threshold_std": 0.0,
+            "flag_threshold_multiplier": 0.0,
             "flagged_producers": [],
         }
 
     total_samples = len(predictions_df)
+    has_confidence = "confidence" in predictions_df.columns
 
-    per_producer = (
-        predictions_df.groupby("producer_id", as_index=False)
-        .agg(
-            sample_count=("producer_id", "count"),
-            correct_count=("is_correct", "sum"),
-        )
+    agg_dict: Dict = {
+        "sample_count": ("producer_id", "count"),
+        "correct_count": ("is_correct", "sum"),
+    }
+    if has_confidence:
+        agg_dict["avg_confidence"] = ("confidence", "mean")
+
+    per_producer = predictions_df.groupby("producer_id", as_index=False).agg(
+        **agg_dict
     )
 
     per_producer["precision"] = (
@@ -636,9 +657,23 @@ def bias_audit(
         per_producer["sample_count"] / total_samples
     )
 
-    mean_rec_rate = per_producer["recommendation_rate"].mean()
-    flag_threshold = mean_rec_rate * flag_multiplier
-    per_producer["flagged"] = per_producer["recommendation_rate"] > flag_threshold
+    if not has_confidence:
+        per_producer["avg_confidence"] = np.nan
+
+    mean_rec_rate = float(per_producer["recommendation_rate"].mean())
+    std_rec_rate = float(per_producer["recommendation_rate"].std(ddof=0))
+
+    # AA-50: flag producers > std_threshold standard deviations above mean
+    flag_threshold_std = mean_rec_rate + std_threshold * std_rec_rate
+    flag_threshold_mult = mean_rec_rate * flag_multiplier
+
+    per_producer["deviation"] = (
+        (per_producer["recommendation_rate"] - mean_rec_rate)
+        / std_rec_rate
+        if std_rec_rate > 0
+        else 0.0
+    )
+    per_producer["flagged"] = per_producer["recommendation_rate"] > flag_threshold_std
 
     flagged_producers = per_producer.loc[
         per_producer["flagged"], "producer_id"
@@ -648,18 +683,22 @@ def bias_audit(
         "recommendation_rate", ascending=False
     ).reset_index(drop=True)
 
+    display_cols = [
+        "producer_id",
+        "sample_count",
+        "precision",
+        "recommendation_rate",
+        "avg_confidence",
+        "deviation",
+        "flagged",
+    ]
+
     return {
-        "per_producer": per_producer[
-            [
-                "producer_id",
-                "sample_count",
-                "precision",
-                "recommendation_rate",
-                "flagged",
-            ]
-        ],
-        "mean_recommendation_rate": float(mean_rec_rate),
-        "flag_threshold": float(flag_threshold),
+        "per_producer": per_producer[display_cols],
+        "mean_recommendation_rate": mean_rec_rate,
+        "std_recommendation_rate": std_rec_rate,
+        "flag_threshold_std": float(flag_threshold_std),
+        "flag_threshold_multiplier": float(flag_threshold_mult),
         "flagged_producers": flagged_producers,
     }
 
@@ -688,26 +727,34 @@ def print_bias_audit(audit_result: Dict) -> None:
         f"{audit_result['mean_recommendation_rate']:.4f}"
     )
     print(
-        f"Flag threshold (mean x {BIAS_FLAG_MULTIPLIER:.2f}): "
-        f"{audit_result['flag_threshold']:.4f}"
+        f"Std recommendation rate: "
+        f"{audit_result.get('std_recommendation_rate', 0.0):.4f}"
+    )
+    print(
+        f"Flag threshold (mean + {STD_FLAG_THRESHOLD} std): "
+        f"{audit_result.get('flag_threshold_std', audit_result.get('flag_threshold', 0.0)):.4f}"
     )
     print("-" * 80)
 
     for _, row in per_producer.iterrows():
         marker = "  FLAGGED" if row["flagged"] else ""
+        deviation = row.get("deviation", float("nan"))
+        dev_str = f"{deviation:+.2f}σ" if not (isinstance(deviation, float) and deviation != deviation) else "N/A"
         print(
             f"{row['producer_id']:<10} "
             f"samples={int(row['sample_count']):<5} "
             f"precision={row['precision']:.4f}   "
-            f"rec_rate={row['recommendation_rate']:.4f}"
+            f"rec_rate={row['recommendation_rate']:.4f}  "
+            f"dev={dev_str}"
             f"{marker}"
         )
 
     print("-" * 80)
+    threshold_key = "flag_threshold_std" if "flag_threshold_std" in audit_result else "flag_threshold"
     if audit_result["flagged_producers"]:
         print(
-            f"Flagged producers (rec_rate >"
-            f" {audit_result['flag_threshold']:.4f}): "
+            f"Flagged producers (rec_rate > {STD_FLAG_THRESHOLD}σ above mean, "
+            f"threshold={audit_result[threshold_key]:.4f}): "
             f"{audit_result['flagged_producers']}"
         )
     else:

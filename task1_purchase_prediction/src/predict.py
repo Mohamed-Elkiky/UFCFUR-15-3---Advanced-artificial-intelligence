@@ -212,6 +212,123 @@ def predict_reorder(
     return results
 
 
+def forecast_demand(
+    product: str,
+    orders_path: str | Path = DEFAULT_ORDERS_PATH,
+    n_months: int = 12,
+) -> List[Dict]:
+    """Forecast monthly demand and return structured data for charting (AA-52).
+
+    Computes both the current-year predicted demand and the previous-year
+    actual demand for each calendar month, along with a trend label. The
+    forecast uses a simple seasonal model: the historical monthly average
+    plus a linear trend term estimated from the last 24 months of data.
+
+    Parameters
+    ----------
+    product : str
+        Product name to forecast (must match values in orders.csv).
+    orders_path : str | Path
+        Path to the orders CSV file.
+    n_months : int, default=12
+        Number of months to forecast forward from the most recent data month.
+
+    Returns
+    -------
+    List[Dict]
+        One dict per month with keys:
+        ``month_name``, ``predicted_demand``, ``last_year_demand``,
+        ``trend_label``.
+        ``trend_label`` is one of ``"rising"``, ``"stable"``, ``"falling"``.
+    """
+    import calendar
+
+    orders_df = load_orders(orders_path)
+    product_orders = orders_df[orders_df["product"] == product].copy()
+
+    if product_orders.empty:
+        return []
+
+    product_orders["year_month"] = product_orders["order_date"].dt.to_period("M")
+    monthly = (
+        product_orders.groupby("year_month", as_index=False)
+        .agg(demand=("quantity", "sum"))
+    )
+    monthly = monthly.sort_values("year_month").reset_index(drop=True)
+
+    # Build a month-of-year seasonal baseline (average demand per calendar month)
+    monthly["month"] = monthly["year_month"].dt.month
+    seasonal_avg = monthly.groupby("month")["demand"].mean().to_dict()
+
+    # Estimate a linear trend from the last 24 data points
+    recent = monthly.tail(24)
+    if len(recent) >= 2:
+        x = np.arange(len(recent))
+        slope, intercept = np.polyfit(x, recent["demand"].values, 1)
+    else:
+        slope = 0.0
+        intercept = float(recent["demand"].mean()) if not recent.empty else 0.0
+
+    if slope > 0.5:
+        base_trend = "rising"
+    elif slope < -0.5:
+        base_trend = "falling"
+    else:
+        base_trend = "stable"
+
+    # Determine the starting month for forecast
+    if not monthly.empty:
+        last_period = monthly["year_month"].iloc[-1]
+        start_year = last_period.year
+        start_month = last_period.month + 1
+        if start_month > 12:
+            start_month = 1
+            start_year += 1
+    else:
+        import datetime
+        now = datetime.date.today()
+        start_year, start_month = now.year, now.month
+
+    results: List[Dict] = []
+    for i in range(n_months):
+        month = (start_month - 1 + i) % 12 + 1
+        year = start_year + (start_month - 1 + i) // 12
+
+        seasonal_base = seasonal_avg.get(month, float(np.mean(list(seasonal_avg.values()))))
+        trend_offset = slope * (len(monthly) + i)
+        predicted_demand = max(0.0, round(seasonal_base + trend_offset, 1))
+
+        # Last year's actual demand for the same month
+        last_year_period = f"{year - 1}-{month:02d}"
+        ly_rows = monthly[monthly["year_month"].astype(str) == last_year_period]
+        last_year_demand = (
+            float(ly_rows["demand"].iloc[0]) if not ly_rows.empty else None
+        )
+
+        # Refine trend label per month
+        if last_year_demand is not None and last_year_demand > 0:
+            ratio = predicted_demand / last_year_demand
+            if ratio > 1.10:
+                trend_label = "rising"
+            elif ratio < 0.90:
+                trend_label = "falling"
+            else:
+                trend_label = "stable"
+        else:
+            trend_label = base_trend
+
+        results.append(
+            {
+                "month_name": f"{calendar.month_name[month]} {year}",
+                "predicted_demand": predicted_demand,
+                "last_year_demand": last_year_demand,
+                "trend_label": trend_label,
+            }
+        )
+
+    return results
+
+
 if __name__ == "__main__":
     customer_id = "CUST001"
 

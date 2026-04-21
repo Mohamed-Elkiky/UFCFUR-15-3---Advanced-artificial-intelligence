@@ -76,6 +76,10 @@ def create_app() -> Flask:
     register_routes(app)
     register_logger(app)
 
+    # Mount the XAI admin dashboard at /admin/xai (AA-49)
+    from task2_3_4_cv_quality.xai.dashboard import build_dashboard
+    build_dashboard(app)
+
     with app.app_context():
         _load_quality_model(app)
         _load_reorder_model(app)
