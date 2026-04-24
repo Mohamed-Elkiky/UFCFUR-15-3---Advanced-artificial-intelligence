@@ -27,6 +27,7 @@ notebook>=7.0.0
 
 # Model Evaluation & Metrics
 scikit-learn>=1.3.0
+xgboost>=2.0.0
 
 # Explainable AI (for XAI component)
 captum>=0.6.0

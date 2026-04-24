@@ -42,3 +42,27 @@ grading_thresholds:
     color: 65
     size: 70
     ripeness: 60
+
+
+# Task 1 Purchase Prediction hyperparameters
+task1_purchase_prediction:
+  hyperparameters:
+    random_forest:
+      n_estimators: 200
+      max_depth: 12
+      min_samples_split: 4
+      min_samples_leaf: 2
+      random_state: 42
+      class_weight: balanced
+    xgboost:
+      n_estimators: 200
+      max_depth: 8
+      learning_rate: 0.1
+      subsample: 0.8
+      colsample_bytree: 0.8
+      random_state: 42
+    logistic_regression:
+      solver: lbfgs
+      max_iter: 200
+      C: 1.0
+      random_state: 42

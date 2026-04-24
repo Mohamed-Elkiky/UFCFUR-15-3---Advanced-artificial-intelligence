@@ -15,9 +15,17 @@ from typing import List, Sequence, Tuple
 
 import joblib
 import pandas as pd
+import yaml
+from sklearn.base import ClassifierMixin
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report
 from sklearn.model_selection import train_test_split
+
+try:
+    from xgboost import XGBClassifier
+except ImportError:  # pragma: no cover - optional dependency
+    XGBClassifier = None
 
 from task1_purchase_prediction.src.preprocess import (
     history_to_feature_row,
@@ -173,6 +181,63 @@ def train_reorder_model(
     print(f"Saved class names to: {Path(class_names_path)}")
 
     return model
+
+
+def compare_models(
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+    y_train: pd.Series,
+    y_test: pd.Series,
+) -> dict:
+    """
+    Train and compare multiple algorithms using ``config.yaml`` hyperparameters.
+
+    Evaluates random forest, xgboost, and logistic regression on the same split
+    and returns per-model metrics.
+    """
+    config_path = BASE_DIR.parent / "config.yaml"
+    with config_path.open("r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+
+    hyperparams = config.get("task1_purchase_prediction", {}).get("hyperparameters", {})
+
+    model_builders: list[tuple[str, ClassifierMixin | None]] = [
+        ("random_forest", RandomForestClassifier(**hyperparams.get("random_forest", {}))),
+        (
+            "xgboost",
+            XGBClassifier(**hyperparams.get("xgboost", {})) if XGBClassifier is not None else None,
+        ),
+        (
+            "logistic_regression",
+            LogisticRegression(**hyperparams.get("logistic_regression", {})),
+        ),
+    ]
+
+    results: dict = {}
+
+    for model_name, model in model_builders:
+        if model is None:
+            results[model_name] = {
+                "status": "skipped",
+                "reason": "xgboost is not installed",
+            }
+            continue
+
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+
+        results[model_name] = {
+            "status": "ok",
+            "accuracy": float(accuracy_score(y_test, y_pred)),
+            "classification_report": classification_report(
+                y_test,
+                y_pred,
+                zero_division=0,
+                output_dict=True,
+            ),
+        }
+
+    return results
 
 
 if __name__ == "__main__":
